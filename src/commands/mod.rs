@@ -15,10 +15,11 @@ mod switch;
 mod update;
 mod which;
 
+pub use crate::registry::BinaryName;
 use crate::{handlers::self_::check_for_updates, types::BinaryVersion};
 
-use anyhow::{anyhow, bail, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use anyhow::{Result, anyhow, bail};
+use clap::{Parser, Subcommand};
 use comfy_table::Table;
 pub const TABLE_FORMAT: &str = "  ── ══      ──    ";
 #[derive(Parser)]
@@ -58,24 +59,35 @@ pub enum Commands {
 }
 
 impl Command {
+    fn normalized_github_token(&self) -> Option<String> {
+        self.github_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
     pub async fn exec(&self) -> Result<()> {
         // Check for updates before executing any command (except self update to avoid recursion)
         if !matches!(self.command, Commands::Self_(_)) && !self.disable_update_warnings {
             check_for_updates();
         }
 
+        let github_token = self.normalized_github_token();
+        let github_token_ref = github_token.as_deref();
+
         match &self.command {
             Commands::Default(cmd) => cmd.exec(),
-            Commands::Doctor(cmd) => cmd.exec(&self.github_token).await,
-            Commands::Install(cmd) => cmd.exec(&self.github_token).await,
-            Commands::Remove(cmd) => cmd.exec(&self.github_token).await,
-            Commands::List(cmd) => cmd.exec(&self.github_token).await,
+            Commands::Doctor(cmd) => cmd.exec(github_token_ref).await,
+            Commands::Install(cmd) => cmd.exec(github_token_ref).await,
+            Commands::Remove(cmd) => cmd.exec(github_token_ref).await,
+            Commands::List(cmd) => cmd.exec(github_token_ref).await,
             Commands::Self_(cmd) => cmd.exec().await,
             Commands::Show(cmd) => cmd.exec(),
             Commands::Switch(cmd) => cmd.exec(),
-            Commands::Update(cmd) => cmd.exec(&self.github_token).await,
+            Commands::Update(cmd) => cmd.exec(github_token_ref).await,
             Commands::Which(cmd) => cmd.exec(),
-            Commands::Cleanup(cmd) => cmd.exec(&self.github_token).await,
+            Commands::Cleanup(cmd) => cmd.exec(github_token_ref).await,
             #[cfg(feature = "nix-patchelf")]
             Commands::Patch(cmd) => cmd.exec(),
         }
@@ -115,10 +127,7 @@ pub enum ComponentCommands {
     #[command(
         about = "Remove one. By default, the binary from each release will be removed. Use --version to specify which exact version to remove"
     )]
-    Remove {
-        #[arg(value_enum)]
-        binary: BinaryName,
-    },
+    Remove { binary: String },
     #[command(about = "Cleanup cache files")]
     Cleanup {
         /// Remove all cache files
@@ -134,19 +143,6 @@ pub enum ComponentCommands {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Hash, Eq, ValueEnum)]
-#[value(rename_all = "lowercase")]
-pub enum BinaryName {
-    #[value(name = "mvr")]
-    Mvr,
-    #[value(name = "sui")]
-    Sui,
-    #[value(name = "walrus")]
-    Walrus,
-    #[value(name = "site-builder")]
-    WalrusSites,
-}
-
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct CommandMetadata {
     pub name: BinaryName,
@@ -154,93 +150,47 @@ pub struct CommandMetadata {
     pub version: Option<String>,
 }
 
-impl BinaryName {
-    pub fn repo_url(&self) -> &str {
-        match self {
-            BinaryName::Mvr => "https://github.com/MystenLabs/mvr",
-            BinaryName::Walrus => "https://github.com/MystenLabs/walrus",
-            BinaryName::WalrusSites => "https://github.com/MystenLabs/walrus-sites",
-            _ => "https://github.com/MystenLabs/sui",
-        }
-    }
-
-    pub fn to_str(&self) -> &str {
-        match self {
-            BinaryName::Mvr => "mvr",
-            BinaryName::Sui => "sui",
-            BinaryName::Walrus => "walrus",
-            BinaryName::WalrusSites => "site-builder",
-        }
-    }
+fn parse_binary_name(name: &str) -> Result<BinaryName> {
+    BinaryName::new(name).map_err(|_| {
+        anyhow!(
+            "Invalid binary name: {name}. Use `suiup list` to find available binaries to install or `suiup show` to see which binaries are already installed.\nWhen specifying versions, use `@`, e.g.: sui@v1.60.0\n\nMore information in the docs: https://github.com/mystenLabs/suiup?tab=readme-ov-file#switch-between-versions-note-that-default-set-requires-to-specify-a-version"
+        )
+    })
 }
 
-impl std::fmt::Display for BinaryName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BinaryName::Mvr => write!(f, "mvr"),
-            BinaryName::Sui => write!(f, "sui"),
-            BinaryName::Walrus => write!(f, "walrus"),
-            BinaryName::WalrusSites => write!(f, "site-builder"),
+fn split_component_spec(s: &str) -> (&str, Option<&str>) {
+    for delimiter in ["@", "==", "="] {
+        if let Some((name, spec)) = s.split_once(delimiter) {
+            return (name, Some(spec));
         }
     }
-}
 
-impl std::str::FromStr for BinaryName {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "sui" => Ok(BinaryName::Sui),
-            "mvr" => Ok(BinaryName::Mvr),
-            "walrus" => Ok(BinaryName::Walrus),
-            "site-builder" => Ok(BinaryName::WalrusSites),
-            _ => Err(format!("Unknown binary: {}", s)),
-        }
+    if let Some((name, spec)) = s.split_once(' ') {
+        return (name, Some(spec));
     }
+
+    (s, None)
 }
 
 pub fn parse_component_with_version(s: &str) -> Result<CommandMetadata, anyhow::Error> {
-    let split_char = if s.contains("@") {
-        "@"
-    } else if s.contains("==") {
-        "=="
-    } else if s.contains("=") {
-        "="
-    } else {
-        // TODO this is a hack because we don't have a better way to split
-        " "
-    };
+    let (name, version_spec) = split_component_spec(s);
+    let component = parse_binary_name(name)?;
 
-    let parts: Vec<&str> = s.split(split_char).collect();
-
-    match parts.len() {
-        1 => {
-            let component = BinaryName::from_str(parts[0], true)
-                .map_err(|_| anyhow!("Invalid binary name: {}. Use `suiup list` to find available binaries to install.", parts[0]))?;
-            let (network, version) = parse_version_spec(None)?;
-            let component_metadata = CommandMetadata {
-                name: component,
-                network,
-                version,
-            };
-            Ok(component_metadata)
-        }
-        2 => {
-            let component = BinaryName::from_str(parts[0], true)
-                .map_err(|_| anyhow!("Invalid binary name: {}. Use `suiup list` to find available binaries to install.", parts[0]))?;
-            let (network, version) = parse_version_spec(Some(parts[1].to_string()))?;
-            let component_metadata = CommandMetadata {
-                name: component,
-                network,
-                version,
-            };
-            Ok(component_metadata)
-        }
-        _ => bail!("Invalid format. Use 'binary' or 'binary version'".to_string()),
+    if let Some(spec) = version_spec
+        && spec.is_empty()
+    {
+        bail!("Version cannot be empty. Use 'binary' or 'binary@version' (e.g., sui@v1.60.0)");
     }
+
+    let (network, version) = parse_version_spec(version_spec)?;
+    Ok(CommandMetadata {
+        name: component,
+        network,
+        version,
+    })
 }
 
-pub fn parse_version_spec(spec: Option<String>) -> Result<(String, Option<String>)> {
+pub fn parse_version_spec(spec: Option<&str>) -> Result<(String, Option<String>)> {
     match spec {
         None => Ok(("testnet".to_string(), None)),
         Some(spec) => {
@@ -251,17 +201,27 @@ pub fn parse_version_spec(spec: Option<String>) -> Result<(String, Option<String
                 let parts: Vec<&str> = spec.splitn(2, '-').collect();
                 Ok((parts[0].to_string(), Some(parts[1].to_string())))
             } else if spec == "testnet" || spec == "devnet" || spec == "mainnet" {
-                Ok((spec, None))
+                Ok((spec.to_string(), None))
             } else {
-                // Assume it's a version for testnet
-                Ok(("testnet".to_string(), Some(spec)))
+                // Validate that it looks like a version (starts with 'v' + digit or digit, and contains a dot)
+                let starts_valid = spec.chars().next().is_some_and(|c| {
+                    c.is_ascii_digit()
+                        || (c == 'v' && spec.chars().nth(1).is_some_and(|c2| c2.is_ascii_digit()))
+                });
+                let has_dot = spec.contains('.');
+                if !starts_valid || !has_dot {
+                    bail!(
+                        "Invalid version format: '{spec}'. Expected a version like 'v1.60.0' or '1.60.0', or when applicable, 'testnet', 'devnet', 'mainnet'.",
+                    );
+                }
+                Ok(("testnet".to_string(), Some(spec.to_string())))
             }
         }
     }
 }
 
-pub fn print_table(binaries: &Vec<BinaryVersion>) {
-    let mut binaries_vec = binaries.clone();
+pub fn print_table(binaries: &[BinaryVersion]) {
+    let mut binaries_vec = binaries.to_owned();
     // sort by Binary column
     binaries_vec.sort_by_key(|b| b.binary_name.clone());
     let mut table = Table::new();
@@ -291,9 +251,22 @@ pub fn print_table(binaries: &Vec<BinaryVersion>) {
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
+    use clap::Parser;
 
     #[test]
     fn verify_command() {
         super::Command::command().debug_assert();
+    }
+
+    #[test]
+    fn normalize_empty_github_token_to_none() {
+        let cmd = super::Command::parse_from(["suiup", "--github-token", "", "list"]);
+        assert_eq!(cmd.normalized_github_token(), None);
+    }
+
+    #[test]
+    fn preserve_non_empty_github_token() {
+        let cmd = super::Command::parse_from(["suiup", "--github-token", "abc123", "list"]);
+        assert_eq!(cmd.normalized_github_token(), Some("abc123".to_string()));
     }
 }

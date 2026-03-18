@@ -66,14 +66,14 @@ get_download_url() {
     os=$1
     arch=$2
     version=$3
-    
+
     # Construct the filename based on OS and architecture
     if [ "$os" = "macos" ]; then
         echo "${RELEASES_URL}/download/${version}/suiup-macOS-${arch}.tar.gz"
     elif [ "$os" = "linux" ]; then
         echo "${RELEASES_URL}/download/${version}/suiup-Linux-musl-${arch}.tar.gz"
     elif [ "$os" = "windows" ]; then
-        echo "${RELEASES_URL}/download/${version}/suiup-x86_64-pc-windows-msvc"
+        echo "${RELEASES_URL}/download/${version}/suiup-Windows-msvc-${arch}.zip"
     else
         echo ""
     fi
@@ -82,7 +82,7 @@ get_download_url() {
 # Determine installation directory
 get_install_dir() {
     os=$1
-    
+
     if [ "$os" = "macos" ] || [ "$os" = "linux" ]; then
         # Use ~/.local/bin on Unix-like systems if it exists or can be created
         local_bin="$HOME/.local/bin"
@@ -113,21 +113,21 @@ get_install_dir() {
 check_path() {
     dir=$1
     os=$2
-    
+
     # Different path separators for different OSes
     separator=":"
     if [ "$os" = "windows" ]; then
         separator=";"
     fi
-    
+
     # POSIX-compliant way to check if directory is in PATH
     case ":$PATH:" in
-        *":$dir:"*) 
+        *":$dir:"*)
             printf '%b%s is already in your PATH%b\n' "${GREEN}" "$dir" "${NC}"
             ;;
         *)
             printf '%bWarning: %s is not in your PATH%b\n' "${YELLOW}" "$dir" "${NC}"
-            
+
             # Provide instructions based on OS
             if [ "$os" = "macos" ] || [ "$os" = "linux" ]; then
                 printf 'Add the following to your shell profile (~/.bashrc, ~/.zshrc, etc.):\n'
@@ -146,9 +146,9 @@ check_path() {
 download_file() {
     url=$1
     output_file=$2
-    
+
     printf 'Downloading %s to %s...\n' "$url" "$output_file"
-    
+
     # Check if GITHUB_TOKEN is set and use it for authentication
     auth_header=""
     if [ -n "$GITHUB_TOKEN" ]; then
@@ -179,20 +179,24 @@ check_existing_binaries() {
     local os=$2
     local found_binaries=""
     local binary
+    local binary_to_check
 
     # List of binaries to check
-    for binary in sui mvr walrus; do
+    for binary in sui mvr walrus site-builder; do
+        # Add .exe extension for Windows binaries
+        if [ "$os" = "windows" ]; then
+            binary_to_check="${binary}.exe"
+        else
+            binary_to_check="$binary"
+        fi
+
         # Check if binary exists in PATH
-        if command -v "$binary" >/dev/null 2>&1; then
-            # Get the full path of the existing binary
-            existing_path=$(command -v "$binary")
-            # Only warn if it's not in our installation directory
-            if [ "$existing_path" != "$install_dir/$binary" ]; then
-                if [ -n "$found_binaries" ]; then
-                    found_binaries="$found_binaries, $binary"
-                else
-                    found_binaries="$binary"
-                fi
+        if command -v "$binary_to_check" >/dev/null 2>&1; then
+            # Binary exists, add it to the warning list
+            if [ -n "$found_binaries" ]; then
+                found_binaries="$found_binaries, $binary"
+            else
+                found_binaries="$binary"
             fi
         fi
     done
@@ -204,7 +208,7 @@ check_existing_binaries() {
         printf '%s\n' "You have two options:"
         printf '1. Uninstall the existing binaries\n'
         printf '2. Ensure %s is listed BEFORE other directories in your PATH\n' "$install_dir"
-        
+
         if [ "$os" = "macos" ] || [ "$os" = "linux" ]; then
             printf '\nTo check your current PATH order, run:\n'
             printf '%becho $PATH | tr ":" "\\n" | nl%b\n' "${CYAN}" "${NC}"
@@ -228,64 +232,72 @@ install_suiup() {
     os=$(detect_os)
     arch=$(detect_arch)
     version=$(get_latest_version)
-    
+
     if [ -z "$version" ]; then
         printf '%bError: Could not fetch latest version%b\n' "${RED}" "${NC}"
         exit 1
     fi
-    
+
     download_url=$(get_download_url "$os" "$arch" "$version")
-    
+
     if [ -z "$download_url" ]; then
         printf '%bError: Unsupported OS or architecture: %s/%s%b\n' "${RED}" "$os" "$arch" "${NC}"
         exit 1
     fi
-    
+
     printf 'Detected OS: %s\n' "$os"
     printf 'Detected architecture: %s\n' "$arch"
     printf 'Latest version: %s\n' "$version"
     printf 'Download URL: %s\n' "$download_url"
-    
+
     # Create temporary directory
     tmp_dir=$(mktemp -d)
     trap 'rm -rf "$tmp_dir"' EXIT
-    
+
     # Download the binary
-    binary_file="$tmp_dir/suiup.tar.gz"
-    
+    if [ "$os" = "windows" ]; then
+        binary_file="$tmp_dir/suiup.zip"
+    else
+        binary_file="$tmp_dir/suiup.tar.gz"
+    fi
+
     download_file "$download_url" "$binary_file"
-    
+
     # Extract the binary
     printf 'Extracting binary...\n'
     if [ "$os" = "windows" ]; then
-        printf 'No extraction needed for Windows binaries.\n'
+        unzip -q "$binary_file" -d "$tmp_dir"
     else
         tar -xzf "$binary_file" -C "$tmp_dir"
     fi
-    
+
     # Install to appropriate directory (allow user override via SUIUP_INSTALL_DIR)
     install_dir="${SUIUP_INSTALL_DIR:-$(get_install_dir "$os")}"
     installed_path="$install_dir/suiup"
     if [ "$os" = "windows" ]; then
         installed_path="$install_dir/suiup.exe"
     fi
-    
+
     printf 'Installing to %s...\n' "$installed_path"
-    
+
     # Ensure install directory exists
     mkdir -p "$install_dir"
-    
+
     # Move binary to install directory
-    mv "$tmp_dir/suiup" "$installed_path"
-    
+    if [ "$os" = "windows" ]; then
+        mv "$tmp_dir/suiup.exe" "$installed_path"
+    else
+        mv "$tmp_dir/suiup" "$installed_path"
+    fi
+
     printf '%bSuccessfully installed suiup to %s%b\n' "${GREEN}" "$installed_path" "${NC}"
-    
+
     # Check PATH
     check_path "$install_dir" "$os"
-    
+
     # Check for existing binaries
     check_existing_binaries "$install_dir" "$os"
-    
+
     printf '\n'
     printf 'You can now run %bsuiup --help%b to get started.\n' "${CYAN}" "${NC}"
     printf 'For more information, visit: https://github.com/%s\n' "$GITHUB_REPO"

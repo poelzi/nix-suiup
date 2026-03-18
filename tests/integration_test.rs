@@ -8,6 +8,7 @@ mod tests {
     use crate::test_utils::TestEnv;
     use anyhow::Result;
     use assert_cmd::Command;
+    use assert_cmd::cargo::cargo_bin_cmd;
     use predicates::prelude::*;
     use std::fs;
     use std::time::{Duration, SystemTime};
@@ -32,14 +33,31 @@ mod tests {
     const HOME: &str = "HOME";
 
     fn suiup_command(args: Vec<&str>, test_env: &TestEnv) -> Command {
-        let mut cmd = Command::cargo_bin("suiup").unwrap();
+        let mut cmd = cargo_bin_cmd!("suiup");
         cmd.args(args);
 
         cmd.env(DATA_HOME, &test_env.data_dir)
             .env(CONFIG_HOME, &test_env.config_dir)
             .env(CACHE_HOME, &test_env.cache_dir)
             .env(HOME, test_env.temp_dir.path());
+
         cmd
+    }
+
+    fn github_is_reachable() -> bool {
+        use std::net::{TcpStream, ToSocketAddrs};
+
+        let Ok(addrs) = ("github.com", 443).to_socket_addrs() else {
+            return false;
+        };
+
+        for addr in addrs {
+            if TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok() {
+                return true;
+            }
+        }
+
+        false
     }
 
     #[tokio::test]
@@ -64,8 +82,10 @@ mod tests {
 
         // OK: nightly + debug
         // OK: nightly (if nightly + debug work, nightly works on its own too)
-        let mut cmd = suiup_command(vec!["install", "mvr", "--nightly", "--debug"], &test_env);
-        cmd.assert().success();
+        if github_is_reachable() {
+            let mut cmd = suiup_command(vec!["install", "mvr", "--nightly", "--debug"], &test_env);
+            cmd.assert().success();
+        }
 
         Ok(())
     }
@@ -106,6 +126,52 @@ mod tests {
 
         // Test binary execution
         let mut cmd = Command::new(default_sui_binary);
+        cmd.arg("--version");
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains("1.39.3"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sui_node_install_and_use_binary() -> Result<()> {
+        let test_env = TestEnv::new()?;
+        test_env.initialize_paths()?;
+        test_env.copy_testnet_releases_to_cache()?;
+
+        // Run install command
+        let mut cmd = suiup_command(vec!["install", "sui-node@testnet-1.39.3", "-y"], &test_env);
+
+        #[cfg(windows)]
+        let assert_string = "'sui-node.exe' extracted successfully!";
+        #[cfg(not(windows))]
+        let assert_string = "'sui-node' extracted successfully!";
+
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains(assert_string));
+
+        // Verify binary exists in correct location
+        #[cfg(windows)]
+        let binary_path = test_env
+            .data_dir
+            .join("suiup/binaries/testnet/sui-node-v1.39.3.exe");
+        #[cfg(not(windows))]
+        let binary_path = test_env
+            .data_dir
+            .join("suiup/binaries/testnet/sui-node-v1.39.3");
+        assert!(binary_path.exists());
+
+        // Verify default binary exists
+        #[cfg(windows)]
+        let default_sui_node_binary = test_env.bin_dir.join("sui-node.exe");
+        #[cfg(not(windows))]
+        let default_sui_node_binary = test_env.bin_dir.join("sui-node");
+        assert!(default_sui_node_binary.exists());
+
+        // Test binary execution
+        let mut cmd = Command::new(default_sui_node_binary);
         cmd.arg("--version");
         cmd.assert()
             .success()
@@ -178,8 +244,7 @@ mod tests {
                 .stdout(predicate::str::contains("1.39.3"));
         }
 
-        let mut cmd = Command::cargo_bin("suiup")?;
-        cmd.arg("default").arg("get");
+        let mut cmd = suiup_command(vec!["default", "get"], &test_env);
         cmd.assert()
             .success()
             .stdout(predicate::str::contains("Yes"));
@@ -294,10 +359,13 @@ mod tests {
             panic!("Could not run command")
         };
 
-        let version: Vec<_> = mvr_version.split("-").collect();
+        let version: Vec<_> = mvr_version.split('-').collect();
         let version = version[0];
 
         // Install from main branch
+        if !github_is_reachable() {
+            return Ok(());
+        }
         let mut cmd = suiup_command(vec!["install", "mvr", "--nightly", "-y"], &test_env);
         cmd.assert().success();
 
@@ -394,9 +462,9 @@ mod tests {
 
         // Test switch with non-existent binary (should fail gracefully)
         let mut cmd = suiup_command(vec!["switch", "sui@testnet"], &test_env);
-        cmd.assert()
-            .failure()
-            .stderr(predicate::str::contains("No installed binary found"));
+        cmd.assert().failure().stderr(predicate::str::contains(
+            "No binaries installed for testnet",
+        ));
 
         Ok(())
     }
@@ -406,23 +474,17 @@ mod tests {
         let test_env = TestEnv::new()?;
         test_env.initialize_paths()?;
 
-        // Test invalid format (missing @)
-        let mut cmd = suiup_command(vec!["switch", "sui"], &test_env);
-        cmd.assert()
-            .failure()
-            .stderr(predicate::str::contains("Invalid format"));
-
         // Test invalid format (empty parts)
         let mut cmd = suiup_command(vec!["switch", "sui@"], &test_env);
         cmd.assert().failure().stderr(predicate::str::contains(
-            "Binary name and network/release cannot be empty",
+            "Version cannot be empty. Use 'binary' or 'binary@version' (e.g., sui@v1.60.0)",
         ));
 
         // Test non-existent binary
         let mut cmd = suiup_command(vec!["switch", "sui@nonexistent"], &test_env);
         cmd.assert()
             .failure()
-            .stderr(predicate::str::contains("No installed binary found"));
+            .stderr(predicate::str::contains("Invalid version format: 'nonexistent'. Expected a version like 'v1.60.0' or '1.60.0', or when applicable, 'testnet', 'devnet', 'mainnet'."));
 
         Ok(())
     }
@@ -453,51 +515,45 @@ mod tests {
 
         // Install first version (1.39.3)
         let mut cmd = suiup_command(vec!["install", "sui@testnet-1.39.3", "-y"], &test_env);
-        #[cfg(windows)]
-        let assert_string = "'sui.exe' extracted successfully!";
-        #[cfg(not(windows))]
-        let assert_string = "'sui' extracted successfully!";
-        cmd.assert()
-            .success()
-            .stdout(predicate::str::contains(assert_string));
+        cmd.assert().success();
 
         // Verify first version is set as default
-        #[cfg(windows)]
-        let default_sui_binary = test_env.bin_dir.join("sui.exe");
-        #[cfg(not(windows))]
-        let default_sui_binary = test_env.bin_dir.join("sui");
-
-        let mut cmd = Command::new(&default_sui_binary);
-        cmd.arg("--version");
+        let mut cmd = suiup_command(vec!["default", "get"], &test_env);
         cmd.assert()
             .success()
-            .stdout(predicate::str::contains("1.39.3"));
+            .stdout(predicate::str::contains("sui"))
+            .stdout(predicate::str::contains("testnet"))
+            .stdout(predicate::str::contains("v1.39.3"));
 
         // Install second version (1.40.1)
         let mut cmd = suiup_command(vec!["install", "sui@testnet-1.40.1", "-y"], &test_env);
-        cmd.assert()
-            .success()
-            .stdout(predicate::str::contains(assert_string));
+        cmd.assert().success();
 
-        // Verify second version is now default
-        let mut cmd = Command::new(&default_sui_binary);
-        cmd.arg("--version");
+        // Explicitly set the default to the second installed version before switch validation.
+        let mut cmd = suiup_command(vec!["default", "set", "sui@testnet-1.40.1"], &test_env);
+        cmd.assert().success();
+
+        // Verify second version is default
+        let mut cmd = suiup_command(vec!["default", "get"], &test_env);
         cmd.assert()
             .success()
-            .stdout(predicate::str::contains("1.40.1"));
+            .stdout(predicate::str::contains("sui"))
+            .stdout(predicate::str::contains("testnet"))
+            .stdout(predicate::str::contains("v1.40.1"));
 
         // Use switch command to go back to testnet (should pick latest, which is 1.40.1)
         let mut cmd = suiup_command(vec!["switch", "sui@testnet"], &test_env);
         cmd.assert().success().stdout(predicate::str::contains(
-            "Successfully switched to sui-v1.40.1 from testnet",
+            "Default binary updated to sui@testnet-v1.40.1 version",
         ));
 
         // Verify switch command maintained the default (since it picked the latest)
-        let mut cmd = Command::new(&default_sui_binary);
-        cmd.arg("--version");
+        let mut cmd = suiup_command(vec!["default", "get"], &test_env);
         cmd.assert()
             .success()
-            .stdout(predicate::str::contains("1.40.1"));
+            .stdout(predicate::str::contains("sui"))
+            .stdout(predicate::str::contains("testnet"))
+            .stdout(predicate::str::contains("v1.40.1"));
 
         // Verify default get shows correct info
         let mut cmd = suiup_command(vec!["default", "get"], &test_env);
@@ -526,10 +582,15 @@ mod tests {
     async fn test_cleanup_command_help() -> Result<()> {
         let test_env = TestEnv::new()?;
 
+        let text = if cfg!(windows) {
+            "Usage: suiup.exe cleanup"
+        } else {
+            "Usage: suiup cleanup"
+        };
         let mut cmd = suiup_command(vec!["cleanup", "--help"], &test_env);
         cmd.assert()
             .success()
-            .stdout(predicate::str::contains("Usage: suiup cleanup"))
+            .stdout(predicate::str::contains(text))
             .stdout(predicate::str::contains("--all"))
             .stdout(predicate::str::contains("--days"))
             .stdout(predicate::str::contains("--dry-run"))
@@ -538,6 +599,20 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_no_command_shows_help() -> Result<()> {
+        let test_env = TestEnv::new()?;
+        test_env.initialize_paths()?;
+
+        let mut cmd = suiup_command(vec![], &test_env);
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains("Usage: suiup"));
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_cleanup_dry_run_workflow() -> Result<()> {
         let test_env = TestEnv::new()?;

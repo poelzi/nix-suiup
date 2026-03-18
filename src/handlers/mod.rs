@@ -3,12 +3,12 @@
 
 use crate::paths::{binaries_dir, get_default_bin_dir, release_archive_dir};
 use crate::{paths::default_file_path, types::Version};
-use anyhow::anyhow;
+use anyhow::Context;
 use anyhow::Error;
+use anyhow::anyhow;
 use flate2::read::GzDecoder;
 use std::env;
 use std::io::Write;
-use std::path::PathBuf;
 use std::{fs::File, io::BufReader};
 
 use crate::types::{BinaryVersion, InstalledBinaries};
@@ -26,15 +26,14 @@ pub mod install;
 pub mod release;
 pub mod self_;
 pub mod show;
-pub mod switch;
 pub mod update;
 pub mod version;
 pub mod which;
 
 pub const RELEASES_ARCHIVES_FOLDER: &str = "releases";
 
-pub fn available_components() -> &'static [&'static str] {
-    &["sui", "mvr", "walrus", "site-builder"]
+pub fn available_components() -> Vec<&'static str> {
+    crate::registry::BinaryRegistry::global().all_names()
 }
 
 // Main component handling function
@@ -47,9 +46,16 @@ pub fn update_default_version_file(
     debug: bool,
 ) -> Result<(), Error> {
     let path = default_file_path()?;
-    let file = File::open(&path)?;
+    let file = File::open(&path)
+        .with_context(|| format!("Cannot open default version file {}", path.display()))?;
     let reader = BufReader::new(file);
-    let mut map: BTreeMap<String, (String, Version, bool)> = serde_json::from_reader(reader)?;
+    let mut map: BTreeMap<String, (String, Version, bool)> = serde_json::from_reader(reader)
+        .map_err(|e| {
+            anyhow!(
+                "Cannot deserialize default version file {}: {e}",
+                path.display()
+            )
+        })?;
 
     for binary in binaries {
         let b = map.get_mut(binary);
@@ -65,8 +71,12 @@ pub fn update_default_version_file(
         }
     }
 
-    let mut file = File::create(path)?;
-    file.write_all(serde_json::to_string_pretty(&map)?.as_bytes())?;
+    let mut file = File::create(&path)
+        .with_context(|| format!("Cannot create default version file {}", path.display()))?;
+    let payload =
+        serde_json::to_string_pretty(&map).context("Cannot serialize default version map")?;
+    file.write_all(payload.as_bytes())
+        .with_context(|| format!("Cannot write default version file {}", path.display()))?;
 
     Ok(())
 }
@@ -100,8 +110,15 @@ pub fn update_after_install(
                 .join(format!("{}-{}", binary_name, version))
         };
 
-        #[cfg(target_os = "windows")]
-        let binary_path = binary_path.with_extension("exe");
+        #[cfg(windows)]
+        let mut binary_path = binary_path.clone();
+        #[cfg(windows)]
+        {
+            if binary_path.extension() != Some("exe".as_ref()) {
+                let new_binary_path = format!("{}.exe", binary_path.display());
+                binary_path.set_file_name(new_binary_path);
+            }
+        }
 
         if !binary_path.exists() {
             println!(
@@ -158,7 +175,7 @@ pub fn update_after_install(
                     })?;
                 }
 
-                #[cfg(target_os = "windows")]
+                #[cfg(windows)]
                 let filename = format!("{}.exe", filename);
 
                 println!(
@@ -172,10 +189,17 @@ pub fn update_after_install(
 
                 println!("Setting {} as default", binary);
 
-                #[cfg(target_os = "windows")]
+                #[cfg(windows)]
                 let mut dst = dst.clone();
-                #[cfg(target_os = "windows")]
-                dst.set_extension("exe");
+                #[cfg(windows)]
+                {
+                    if dst.extension() != Some("exe".as_ref()) {
+                        let new_dst = format!("{}.exe", dst.display());
+                        dst.set_file_name(new_dst);
+                    }
+                }
+
+                tracing::debug!("Copying from {} to {}", src.display(), dst.display());
 
                 std::fs::copy(&src, &dst).map_err(|e| {
                     anyhow!(
@@ -187,9 +211,15 @@ pub fn update_after_install(
 
                 #[cfg(unix)]
                 {
-                    let mut perms = std::fs::metadata(&dst)?.permissions();
+                    let mut perms = std::fs::metadata(&dst)
+                        .with_context(|| {
+                            format!("Cannot read metadata for default binary {}", dst.display())
+                        })?
+                        .permissions();
                     perms.set_mode(0o755);
-                    std::fs::set_permissions(&dst, perms)?;
+                    std::fs::set_permissions(&dst, perms).with_context(|| {
+                        format!("Cannot set executable permissions on {}", dst.display())
+                    })?;
                 }
 
                 println!("[{network}] {binary}-{version} set as default");
@@ -219,10 +249,7 @@ fn check_path_and_warn() -> Result<(), Error> {
         #[cfg(not(windows))]
         let path_separator = ':';
 
-        if !path
-            .split(path_separator)
-            .any(|p| PathBuf::from(p) == local_bin)
-        {
+        if !path.split(path_separator).any(|p| *p == *local_bin) {
             println!("\nWARNING: {} is not in your PATH", local_bin.display());
 
             #[cfg(windows)]
@@ -269,7 +296,7 @@ fn extract_component(orig_binary: &str, network: String, filename: &str) -> Resu
     archive_path.push(filename);
 
     let file = File::open(archive_path.as_path())
-        .map_err(|_| anyhow!("Cannot open archive file: {}", archive_path.display()))?;
+        .with_context(|| format!("Cannot open archive file {}", archive_path.display()))?;
     let tar = GzDecoder::new(file);
     let mut archive = Archive::new(tar);
 
@@ -283,14 +310,27 @@ fn extract_component(orig_binary: &str, network: String, filename: &str) -> Resu
         .entries()
         .map_err(|e| anyhow!("Cannot iterate through archive entries: {e}"))?
     {
-        let mut f = file.unwrap();
-        if f.path()?.file_name().and_then(|x| x.to_str()) == Some(&binary) {
+        let mut f = file.map_err(|e| {
+            anyhow!(
+                "Cannot read entry from archive {}: {e}",
+                archive_path.display()
+            )
+        })?;
+        let entry_path = f.path().map_err(|e| {
+            anyhow!(
+                "Cannot read entry path from archive {}: {e}",
+                archive_path.display()
+            )
+        })?;
+        if entry_path.file_name().and_then(|x| x.to_str()) == Some(&binary) {
             println!("Extracting file: {}", &binary);
 
             let mut output_path = binaries_dir();
             output_path.push(&network);
             if !output_path.is_dir() {
-                std::fs::create_dir_all(output_path.as_path())?;
+                std::fs::create_dir_all(output_path.as_path()).with_context(|| {
+                    format!("Cannot create binaries directory {}", output_path.display())
+                })?;
             }
             let version = extract_version_from_release(filename)?;
             let binary_version = format!("{}-{}", orig_binary, version);
@@ -307,20 +347,24 @@ fn extract_component(orig_binary: &str, network: String, filename: &str) -> Resu
             })?;
 
             std::io::copy(&mut f, &mut output_file).map_err(|e| {
-                anyhow!("Cannot copy the file ({orig_binary}) into the output path: {e}")
+                anyhow!(
+                    "Cannot copy file {} into output path {}: {e}",
+                    orig_binary,
+                    output_path.display()
+                )
             })?;
             println!(" '{}' extracted successfully!", &binary);
             #[cfg(not(target_os = "windows"))]
             {
                 // Retrieve and apply the original file permissions on Unix-like systems
                 if let Ok(permissions) = f.header().mode() {
-                    set_permissions(&output_path, PermissionsExt::from_mode(permissions)).map_err(
-                        |e| {
-                            anyhow!(
-                                "Cannot apply the original file permissions in a unix system: {e}"
+                    set_permissions(&output_path, PermissionsExt::from_mode(permissions))
+                        .with_context(|| {
+                            format!(
+                                "Cannot apply original file permissions to {}",
+                                output_path.display()
                             )
-                        },
-                    )?;
+                        })?;
                 }
             }
 
@@ -329,7 +373,9 @@ fn extract_component(orig_binary: &str, network: String, filename: &str) -> Resu
             {
                 if let Err(e) = crate::patchelf::patch_binary(&output_path) {
                     println!("Warning: Failed to patch binary with patchelf: {}", e);
-                    println!("The binary may not work correctly. Ensure nix-runtime-deps.json is installed.");
+                    println!(
+                        "The binary may not work correctly. Ensure nix-runtime-deps.json is installed."
+                    );
                 }
             }
 
@@ -355,11 +401,16 @@ pub fn check_if_binaries_exist(
         format!("{}-{}", binary, version)
     };
 
-    #[cfg(target_os = "windows")]
-    {
+    // Build the final expected binary path (Windows binaries have .exe extension).
+    // Previous logic incorrectly pushed both the `.exe` file name AND the plain name as an
+    // additional path component on Windows, resulting in a non-existent path like:
+    //   <...>/binaries/<network>/binary.exe/binary-version
+    // This prevented proper detection of already installed binaries.
+    if cfg!(target_os = "windows") {
         path.push(format!("{}.exe", binary_version));
+    } else {
+        path.push(&binary_version);
     }
-    path.push(&binary_version);
     Ok(path.exists())
 }
 
@@ -384,4 +435,98 @@ pub fn installed_binaries_grouped_by_network(
     }
 
     Ok(files_by_folder)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_if_binaries_exist;
+    use crate::paths::binaries_dir;
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    // --- Tests -----------------------------------------------------------------
+    // Internal helper (exposed for tests inside this module) to build the final path; this
+    // lets us unit test both Windows and non-Windows logic irrespective of the host platform.
+    #[cfg(test)]
+    fn build_binary_path(
+        mut base: std::path::PathBuf,
+        binary_version: &str,
+        is_windows: bool,
+    ) -> std::path::PathBuf {
+        if is_windows {
+            base.push(format!("{}.exe", binary_version));
+        } else {
+            base.push(binary_version);
+        }
+        base
+    }
+
+    // Validate helper path construction for both Windows & non-Windows cases.
+    #[test]
+    fn test_build_binary_path() {
+        #[cfg(unix)]
+        {
+            let base_unix = PathBuf::from("/tmp/suiup/binaries/testnet");
+            let p_unix = build_binary_path(base_unix.clone(), "sui-v1.0.0", false);
+            assert!(
+                p_unix
+                    .to_string_lossy()
+                    .ends_with("/tmp/suiup/binaries/testnet/sui-v1.0.0")
+                    || p_unix
+                        .to_string_lossy()
+                        .ends_with("\\tmp\\suiup\\binaries\\testnet\\sui-v1.0.0")
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            let base_win = PathBuf::from("C:/suiup/binaries/testnet");
+            let p_win = build_binary_path(base_win.clone(), "sui-v1.0.0", true);
+            assert!(
+                p_win.to_string_lossy().ends_with("sui-v1.0.0.exe"),
+                "Windows path should end with .exe: {p_win:?}"
+            );
+            // Ensure we did not append an extra plain (non-.exe) component.
+            let components: Vec<_> = p_win.components().collect();
+            let last = components.last().unwrap().as_os_str().to_string_lossy();
+            assert_eq!(last, "sui-v1.0.0.exe");
+        }
+    }
+
+    // Functional test (host-platform specific) verifying existence detection works.
+    #[test]
+    fn test_check_if_binaries_exist_detects_created_file() {
+        // Use a temp dir and point XDG/LOCALAPPDATA to it so binaries_dir() resolves inside it.
+        let temp = tempfile::TempDir::new().unwrap();
+        #[cfg(windows)]
+        let (var, original) = ("LOCALAPPDATA", std::env::var("LOCALAPPDATA").ok());
+        #[cfg(not(windows))]
+        let (var, original) = ("XDG_DATA_HOME", std::env::var("XDG_DATA_HOME").ok());
+        crate::set_env_var!(var, temp.path());
+
+        let mut network_dir = binaries_dir();
+        network_dir.push("testnet");
+        fs::create_dir_all(&network_dir).unwrap();
+
+        let binary_version = "sui-v1.2.3";
+        let mut file_path = network_dir.clone();
+        if cfg!(windows) {
+            file_path.push(format!("{}.exe", binary_version));
+        } else {
+            file_path.push(binary_version);
+        }
+        let mut f = File::create(&file_path).unwrap();
+        writeln!(f, "test").unwrap();
+
+        let exists = check_if_binaries_exist("sui", "testnet".to_string(), "v1.2.3").unwrap();
+        assert!(exists, "Binary should be detected as existing");
+
+        // Restore original environment variable (best effort).
+        if let Some(val) = original {
+            crate::set_env_var!(var, val);
+        } else {
+            crate::remove_env_var!(var);
+        }
+    }
 }

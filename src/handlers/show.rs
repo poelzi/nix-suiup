@@ -4,22 +4,30 @@
 use crate::{
     handlers::installed_binaries_grouped_by_network,
     paths::default_file_path,
-    types::{Binaries, Version},
+    types::{Binaries, BinaryVersion, Version},
 };
-use anyhow::Error;
+use anyhow::{Context, Error, anyhow};
 use std::collections::BTreeMap;
 
 use crate::commands::print_table;
 
 /// Load default binaries from configuration file
 fn load_default_binaries() -> Result<Binaries, Error> {
-    let default = std::fs::read_to_string(default_file_path()?)?;
-    let default: BTreeMap<String, (String, Version, bool)> = serde_json::from_str(&default)?;
+    let default_path = default_file_path()?;
+    let default = std::fs::read_to_string(&default_path)
+        .with_context(|| format!("Cannot read default file {}", default_path.display()))?;
+    let default: BTreeMap<String, (String, Version, bool)> = serde_json::from_str(&default)
+        .map_err(|e| {
+            anyhow!(
+                "Cannot deserialize default file {}: {e}",
+                default_path.display()
+            )
+        })?;
     Ok(Binaries::from(default))
 }
 
 /// Load installed binaries grouped by network
-fn load_installed_binaries() -> Result<Vec<crate::types::BinaryVersion>, Error> {
+fn load_installed_binaries() -> Result<Vec<BinaryVersion>, Error> {
     let installed_binaries = installed_binaries_grouped_by_network(None)?;
     let binaries = installed_binaries
         .into_iter()
@@ -29,7 +37,7 @@ fn load_installed_binaries() -> Result<Vec<crate::types::BinaryVersion>, Error> 
 }
 
 /// Display a section with title and binaries table
-fn display_binaries_section(title: &str, binaries: &Vec<crate::types::BinaryVersion>) {
+fn display_binaries_section(title: &str, binaries: &[BinaryVersion]) {
     println!("\x1b[1m{}:\x1b[0m", title);
     print_table(binaries);
 }
