@@ -6,14 +6,6 @@ on:
     - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
-      auto_commit:
-        description: "Auto-commit changes to main branch (true) or create PR (false)"
-        required: false
-        default: "false"
-        type: choice
-        options:
-          - "true"
-          - "false"
       force:
         description: "Force re-download of all releases"
         required: false
@@ -32,7 +24,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      pull-requests: write
 
     steps:
       - name: Checkout repository
@@ -123,18 +114,7 @@ jobs:
               grep -v "Example commands:" >> changes-summary.txt
           fi
 
-          # Create PR body
-          cat > pr-body.txt << 'EOF'
-          ## Automated Standalone Releases Update
-
-          This PR updates the standalone binary releases in `nix/releases.json`.
-
-          ### Changes
-
-          EOF
-          cat changes-summary.txt >> pr-body.txt
-
-          # Set commit message (first line only for commit, full for PR)
+          # Set commit title
           COMMIT_TITLE="chore: update standalone releases"
           echo "commit_title=$COMMIT_TITLE" >> $GITHUB_OUTPUT
 
@@ -151,50 +131,11 @@ jobs:
             exit 1
           }
 
-          # Generate branch name with timestamp
-          BRANCH_NAME="update-releases-$(date +%Y%m%d-%H%M%S)"
-          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
-
-      - name: Determine action (auto-commit or PR)
+      - name: Push directly to main
         if: steps.update.outputs.has_changes == 'true' && steps.verify.outputs.valid == 'true'
-        id: action
-        run: |
-          # Check if we should auto-commit
-          # Default to PR for scheduled runs, use input for manual runs
-          AUTO_COMMIT="${{ github.event.inputs.auto_commit }}"
-
-          if [ -z "$AUTO_COMMIT" ]; then
-            AUTO_COMMIT="false"
-          fi
-
-          echo "auto_commit=$AUTO_COMMIT" >> $GITHUB_OUTPUT
-          echo "Will $([ "$AUTO_COMMIT" = "true" ] && echo "auto-commit" || echo "create PR")"
-
-      - name: Push directly to main (auto-commit)
-        if: |
-          steps.update.outputs.has_changes == 'true' &&
-          steps.verify.outputs.valid == 'true' &&
-          steps.action.outputs.auto_commit == 'true'
         run: |
           echo "Auto-committing to main branch..."
           git push origin HEAD:main
-
-      - name: Create Pull Request
-        if: |
-          steps.update.outputs.has_changes == 'true' &&
-          steps.verify.outputs.valid == 'true' &&
-          steps.action.outputs.auto_commit == 'false'
-        uses: peter-evans/create-pull-request@v6
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: ${{ steps.summary.outputs.commit_title }}
-          branch: ${{ steps.commit.outputs.branch_name }}
-          title: ${{ steps.summary.outputs.commit_title }}
-          body-path: pr-body.txt
-          labels: |
-            automated
-            dependencies
-          assignees: ${{ github.repository_owner }}
 
       - name: Summary
         if: always()
@@ -207,12 +148,7 @@ jobs:
 
             if [ "${{ steps.verify.outputs.valid }}" = "true" ]; then
               echo "✓ Verification passed - only releases.json modified" >> $GITHUB_STEP_SUMMARY
-
-              if [ "${{ steps.action.outputs.auto_commit }}" = "true" ]; then
-                echo "✓ Changes auto-committed to main branch" >> $GITHUB_STEP_SUMMARY
-              else
-                echo "✓ Pull request created" >> $GITHUB_STEP_SUMMARY
-              fi
+              echo "✓ Changes auto-committed to main branch" >> $GITHUB_STEP_SUMMARY
             else
               echo "✗ Verification failed - unexpected files modified" >> $GITHUB_STEP_SUMMARY
             fi
