@@ -249,7 +249,10 @@ fn check_path_and_warn() -> Result<(), Error> {
         #[cfg(not(windows))]
         let path_separator = ':';
 
-        if !path.split(path_separator).any(|p| *p == *local_bin) {
+        if !path
+            .split(path_separator)
+            .any(|p| std::path::Path::new(p) == local_bin.as_path())
+        {
             println!("\nWARNING: {} is not in your PATH", local_bin.display());
 
             #[cfg(windows)]
