@@ -27,20 +27,37 @@
         # Update with: nix run .#update-releases
         standaloneReleases = builtins.fromJSON (builtins.readFile ./nix/releases.json);
 
-        sourceReleaseDir = ./nix/source-releases;
-        sourceReleaseFileNames = builtins.attrNames (builtins.readDir sourceReleaseDir);
-        sourceReleaseNixFiles = builtins.sort (a: b: a < b) (
-          builtins.filter (name: pkgs.lib.hasSuffix ".nix" name) sourceReleaseFileNames
-        );
-        sourceReleases = builtins.listToAttrs (
-          map (
-            file:
-            let
-              release = import (sourceReleaseDir + "/${file}");
-            in
-            pkgs.lib.nameValuePair release.tag release
-          ) sourceReleaseNixFiles
-        );
+        # Load all *.nix release pin files from a directory into a tag -> release attrset.
+        loadReleasesFromDir =
+          dir:
+          let
+            fileNames = builtins.attrNames (builtins.readDir dir);
+            nixFiles = builtins.sort (a: b: a < b) (
+              builtins.filter (name: pkgs.lib.hasSuffix ".nix" name) fileNames
+            );
+          in
+          builtins.listToAttrs (
+            map (
+              file:
+              let
+                release = import (dir + "/${file}");
+              in
+              pkgs.lib.nameValuePair release.tag release
+            ) nixFiles
+          );
+
+        # Pick the highest mainnet-* tag in a releases attrset (or null if none).
+        latestMainnetTag =
+          releases:
+          let
+            mainnet = pkgs.lib.filterAttrs (tag: _: pkgs.lib.hasPrefix "mainnet-" tag) releases;
+            sortedTags = builtins.sort (a: b: a > b) (builtins.attrNames mainnet);
+          in
+          if sortedTags == [ ] then null else builtins.head sortedTags;
+
+        sourceReleases = loadReleasesFromDir ./nix/source-releases;
+        walrusSourceReleases = loadReleasesFromDir ./nix/source-releases-walrus;
+        sealSourceReleases = loadReleasesFromDir ./nix/source-releases-seal;
 
         rustToolchain = {
           cargo = pkgs.cargo;
@@ -308,6 +325,145 @@
             };
           };
 
+        mkSealSourceBinary =
+          {
+            binaryName,
+            release,
+          }:
+          let
+            fetchedSrc = pkgs.fetchFromGitHub {
+              owner = "MystenLabs";
+              repo = "seal";
+              rev = release.rev;
+              hash = release.srcHash;
+            };
+          in
+          rustPlatformSui.buildRustPackage {
+            pname = "${binaryName}-source";
+            version = release.tag;
+
+            src = fetchedSrc;
+
+            cargoHash = release.cargoHash;
+            cargoBuildFlags = [ "--bin=${binaryName}" ];
+
+            nativeBuildInputs = [
+              pkgs.cmake
+              pkgs.clang
+              pkgs.pkg-config
+              pkgs.protobuf
+            ];
+
+            buildInputs = [
+              pkgs.openssl
+              pkgs.zlib
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+              pkgs.darwin.apple_sdk.frameworks.Security
+              pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
+            ];
+
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            PROTOC = "${pkgs.protobuf}/bin/protoc";
+
+            GIT_REVISION = release.rev;
+            VERGEN_GIT_SHA = release.rev;
+            env.CXXFLAGS = "-include cstdint";
+
+            # Same sui-rpc-api build.rs vendor-workspace patch as mkWalrusSourceBinary.
+            preBuild = ''
+              # The cargo-vendor dir is a SIBLING of $sourceRoot — check ./, ../, /build.
+              for crate in $(find . .. /build -maxdepth 6 -type d -name 'sui-rpc-api-*' 2>/dev/null); do
+                [ -f "$crate/build.rs" ] || continue
+                echo "[suiup] patching $crate/build.rs"
+                cp ${./nix/patches/sui-rpc-api-build.rs} "$crate/build.rs"
+                chmod u+w "$crate/build.rs"
+              done
+            '';
+
+            doCheck = false;
+
+            meta = with pkgs.lib; {
+              description = "${binaryName} built from MystenLabs/seal source (${release.tag})";
+              homepage = "https://github.com/MystenLabs/seal";
+              license = licenses.asl20;
+              maintainers = [ ];
+              mainProgram = binaryName;
+            };
+          };
+
+        mkWalrusSourceBinary =
+          {
+            binaryName,
+            release,
+          }:
+          let
+            fetchedSrc = pkgs.fetchFromGitHub {
+              owner = "MystenLabs";
+              repo = "walrus";
+              rev = release.rev;
+              hash = release.srcHash;
+            };
+          in
+          rustPlatformSui.buildRustPackage {
+            pname = "${binaryName}-source";
+            version = release.tag;
+
+            src = fetchedSrc;
+
+            cargoHash = release.cargoHash;
+            cargoBuildFlags = [ "--bin=${binaryName}" ];
+
+            nativeBuildInputs = [
+              pkgs.cmake
+              pkgs.clang
+              pkgs.pkg-config
+              pkgs.protobuf
+            ];
+
+            buildInputs = [
+              pkgs.openssl
+              pkgs.zlib
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+              pkgs.darwin.apple_sdk.frameworks.Security
+              pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
+            ];
+
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            PROTOC = "${pkgs.protobuf}/bin/protoc";
+
+            # Same git-revision and rocksdb workarounds as mkSuiSourceBinary.
+            GIT_REVISION = release.rev;
+            VERGEN_GIT_SHA = release.rev;
+            env.CXXFLAGS = "-include cstdint";
+
+            # When sui-rpc-api is consumed as a vendored git dep (i.e. NOT
+            # built from inside the sui workspace itself), its build.rs's
+            # `cargo metadata` invocation returns nothing because there is no
+            # surrounding workspace. Replace it with a sibling-directory walk
+            # that works under cargo-vendor.
+            preBuild = ''
+              # The cargo-vendor dir is a SIBLING of $sourceRoot — check ./, ../, /build.
+              for crate in $(find . .. /build -maxdepth 6 -type d -name 'sui-rpc-api-*' 2>/dev/null); do
+                [ -f "$crate/build.rs" ] || continue
+                echo "[suiup] patching $crate/build.rs"
+                cp ${./nix/patches/sui-rpc-api-build.rs} "$crate/build.rs"
+                chmod u+w "$crate/build.rs"
+              done
+            '';
+
+            doCheck = false;
+
+            meta = with pkgs.lib; {
+              description = "${binaryName} built from MystenLabs/walrus source (${release.tag})";
+              homepage = "https://github.com/MystenLabs/walrus";
+              license = licenses.asl20;
+              maintainers = [ ];
+              mainProgram = binaryName;
+            };
+          };
+
         # Generate all standalone binary packages
         standalonePackages = pkgs.lib.flatten (
           pkgs.lib.mapAttrsToList (
@@ -357,6 +513,8 @@
           "sui"
           "sui-node"
           "move-analyzer"
+          "sui-indexer-alt"
+          "sui-indexer-alt-jsonrpc"
         ];
 
         sourcePackages = pkgs.lib.flatten (
@@ -374,12 +532,111 @@
 
         sourcePackagesAttrs = builtins.listToAttrs sourcePackages;
 
-        getLatestSourceMainnet =
+        getLatestSourceMainnet = latestMainnetTag sourceReleases;
+
+        walrusSourceBinaryNames = [
+          "walrus"
+          "walrus-node"
+          "walrus-upload-relay"
+        ];
+
+        walrusSourcePackages = pkgs.lib.flatten (
+          map (
+            binaryName:
+            map (
+              tag:
+              pkgs.lib.nameValuePair "${binaryName}-source-${tag}" (mkWalrusSourceBinary {
+                inherit binaryName;
+                release = walrusSourceReleases.${tag};
+              })
+            ) (builtins.attrNames walrusSourceReleases)
+          ) walrusSourceBinaryNames
+        );
+
+        walrusSourcePackagesAttrs = builtins.listToAttrs walrusSourcePackages;
+
+        getLatestWalrusSourceMainnet = latestMainnetTag walrusSourceReleases;
+
+        sealSourceBinaryNames = [
+          "seal-cli"
+          "key-server"
+        ];
+
+        sealSourcePackages = pkgs.lib.flatten (
+          map (
+            binaryName:
+            map (
+              tag:
+              pkgs.lib.nameValuePair "${binaryName}-source-${tag}" (mkSealSourceBinary {
+                inherit binaryName;
+                release = sealSourceReleases.${tag};
+              })
+            ) (builtins.attrNames sealSourceReleases)
+          ) sealSourceBinaryNames
+        );
+
+        sealSourcePackagesAttrs = builtins.listToAttrs sealSourcePackages;
+
+        # Seal tags don't follow the mainnet-/testnet- naming; just take the
+        # highest tag (lex-sort works since they all start with seal-vX.Y.Z).
+        getLatestSeal =
           let
-            mainnetReleases = pkgs.lib.filterAttrs (tag: _: pkgs.lib.hasPrefix "mainnet-" tag) sourceReleases;
-            sortedTags = builtins.sort (a: b: a > b) (builtins.attrNames mainnetReleases);
+            sortedTags = builtins.sort (a: b: a > b) (builtins.attrNames sealSourceReleases);
           in
           if sortedTags == [ ] then null else builtins.head sortedTags;
+
+        # Move-framework packages (move-stdlib, sui-framework, sui-system,
+        # deepbook, bridge) extracted as their own derivations from each pinned
+        # MystenLabs/sui source release, so downstream Move.lock can pin a
+        # nix store path instead of fetching from GitHub at build time.
+        suiFrameworkPackageNames = [
+          "move-stdlib"
+          "sui-framework"
+          "sui-system"
+          "deepbook"
+          "bridge"
+        ];
+
+        mkSuiFrameworkPackage =
+          {
+            release,
+            packageName,
+          }:
+          let
+            fetchedSrc = pkgs.fetchFromGitHub {
+              owner = "MystenLabs";
+              repo = "sui";
+              rev = release.rev;
+              hash = release.srcHash;
+            };
+          in
+          pkgs.runCommand "${packageName}-${release.tag}"
+            {
+              meta = {
+                description = "MystenLabs/sui ${packageName} Move package (${release.tag})";
+                homepage = "https://github.com/MystenLabs/sui";
+                license = pkgs.lib.licenses.asl20;
+              };
+            }
+            ''
+              cp -r ${fetchedSrc}/crates/sui-framework/packages/${packageName} $out
+              chmod -R u+w $out
+            '';
+
+        moveFrameworkPackages = pkgs.lib.flatten (
+          map (
+            packageName:
+            map (
+              tag:
+              pkgs.lib.nameValuePair "${packageName}-${tag}" (mkSuiFrameworkPackage {
+                inherit packageName;
+                release = sourceReleases.${tag};
+              })
+            ) (builtins.attrNames sourceReleases)
+          ) suiFrameworkPackageNames
+        );
+
+        moveFrameworkPackagesAttrs = builtins.listToAttrs moveFrameworkPackages;
 
         preCommitCheck = pre-commit-hooks.lib.${system}.run {
           src = ./.;
@@ -432,10 +689,97 @@
           latest-mvr = mkLatestAliasCheck "mvr" standalonePackagesAttrs."mvr-${getLatestMainnet "mvr"}";
           latest-walrus =
             mkLatestAliasCheck "walrus"
+              walrusSourcePackagesAttrs."walrus-source-${getLatestWalrusSourceMainnet}";
+          latest-walrus-binary =
+            mkLatestAliasCheck "walrus-binary"
               standalonePackagesAttrs."walrus-${getLatestMainnet "walrus"}";
+          latest-walrus-node =
+            mkLatestAliasCheck "walrus-node"
+              walrusSourcePackagesAttrs."walrus-node-source-${getLatestWalrusSourceMainnet}";
+          latest-walrus-upload-relay =
+            mkLatestAliasCheck "walrus-upload-relay"
+              walrusSourcePackagesAttrs."walrus-upload-relay-source-${getLatestWalrusSourceMainnet}";
           latest-walrus-sites =
             mkLatestAliasCheck "walrus-sites"
               standalonePackagesAttrs."walrus-sites-${getLatestMainnet "walrus-sites"}";
+          latest-seal =
+            mkLatestAliasCheck "seal" sealSourcePackagesAttrs."seal-cli-source-${getLatestSeal}";
+          latest-seal-server =
+            mkLatestAliasCheck "seal-server"
+              sealSourcePackagesAttrs."key-server-source-${getLatestSeal}";
+          latest-sui-indexer-alt =
+            mkLatestAliasCheck "sui-indexer-alt"
+              sourcePackagesAttrs."sui-indexer-alt-source-${getLatestSourceMainnet}";
+          latest-sui-indexer-alt-jsonrpc =
+            mkLatestAliasCheck "sui-indexer-alt-jsonrpc"
+              sourcePackagesAttrs."sui-indexer-alt-jsonrpc-source-${getLatestSourceMainnet}";
+
+          # NixOS VM smoke test: boots `postgres + sui start` in a VM and
+          # verifies the JSON-RPC answers. Uses the standalone (.#sui-binary)
+          # to avoid forcing a full source build — for source-build coverage
+          # use `nix build .#sui` directly.
+          testHarnessSmoke = pkgs.nixosTest {
+            name = "suiup-test-harness-smoke";
+            nodes.machine =
+              { ... }:
+              {
+                imports = [
+                  self.nixosModules.postgresql-sui
+                ];
+
+                services.postgresql-sui.enable = true;
+
+                environment.systemPackages = [ self.packages.${system}.sui-binary ];
+
+                systemd.services.sui-local-net = {
+                  description = "sui start --force-regenesis (test harness)";
+                  wantedBy = [ "multi-user.target" ];
+                  after = [ "network-online.target" "postgresql.service" ];
+                  wants = [ "network-online.target" "postgresql.service" ];
+                  serviceConfig = {
+                    Type = "exec";
+                    Restart = "on-failure";
+                    RestartSec = "5s";
+                    StateDirectory = "sui-local-net";
+                    WorkingDirectory = "/var/lib/sui-local-net";
+                    ExecStart = pkgs.lib.escapeShellArgs [
+                      "${self.packages.${system}.sui-binary}/bin/sui"
+                      "start"
+                      "--force-regenesis"
+                      "--with-faucet=0.0.0.0:9123"
+                      "--with-indexer=postgres://sui_indexer@127.0.0.1:5432/sui_indexer"
+                      "--fullnode-rpc-port"
+                      "9000"
+                      "--epoch-duration-ms"
+                      "60000"
+                      "--network.config"
+                      "/var/lib/sui-local-net/sui-config"
+                    ];
+                  };
+                };
+
+                # The local network needs ample fds.
+                systemd.extraConfig = ''
+                  DefaultLimitNOFILE=65536
+                '';
+              };
+
+            testScript = ''
+              machine.start()
+              machine.wait_for_unit("postgresql.service")
+              machine.wait_for_unit("sui-local-net.service")
+              machine.wait_for_open_port(9000, timeout=180)
+              machine.wait_for_open_port(9123, timeout=180)
+              # Smoke RPC: should return some JSON containing "jsonrpc"
+              machine.succeed(
+                  "curl -sf -X POST -H 'Content-Type: application/json' "
+                  "-d '{\"jsonrpc\":\"2.0\",\"method\":\"suix_getReferenceGasPrice\",\"params\":[],\"id\":1}' "
+                  "http://127.0.0.1:9000 | grep -q jsonrpc"
+              )
+              # Faucet must answer with a 2xx for a basic GET (rejects but reachable).
+              machine.succeed("curl -sf -o /dev/null -w '%{http_code}' http://127.0.0.1:9123/ | grep -E '^(2|4)' >/dev/null")
+            '';
+          };
         };
 
         packages = rec {
@@ -451,12 +795,18 @@
               sui
               sui-node
               move-analyzer
+              sui-indexer-alt
+              sui-indexer-alt-jsonrpc
               walrus
+              walrus-node
+              walrus-upload-relay
               walrus-sites
+              seal
+              seal-server
               mvr
             ];
             meta = {
-              description = "Sui toolkit: suiup + sui, sui-node, move-analyzer (source) + walrus, site-builder, mvr (binary)";
+              description = "Sui toolkit: suiup + sui/sui-node/move-analyzer/sui-indexer-alt(+jsonrpc) (source) + walrus/walrus-node/walrus-upload-relay/seal-cli/key-server (source) + site-builder/mvr (binary)";
               mainProgram = "suiup";
             };
           };
@@ -506,12 +856,39 @@
 
           walrus =
             let
+              latest = getLatestWalrusSourceMainnet;
+            in
+            if latest != null then
+              walrusSourcePackagesAttrs."walrus-source-${latest}"
+            else
+              throw "No mainnet source-built walrus release found";
+
+          walrus-binary =
+            let
               latest = getLatestMainnet "walrus";
             in
             if latest != null then
               standalonePackagesAttrs."walrus-${latest}"
             else
-              throw "No mainnet walrus release found";
+              throw "No mainnet walrus binary release found";
+
+          walrus-node =
+            let
+              latest = getLatestWalrusSourceMainnet;
+            in
+            if latest != null then
+              walrusSourcePackagesAttrs."walrus-node-source-${latest}"
+            else
+              throw "No mainnet source-built walrus-node release found";
+
+          walrus-upload-relay =
+            let
+              latest = getLatestWalrusSourceMainnet;
+            in
+            if latest != null then
+              walrusSourcePackagesAttrs."walrus-upload-relay-source-${latest}"
+            else
+              throw "No mainnet source-built walrus-upload-relay release found";
 
           walrus-sites =
             let
@@ -521,9 +898,94 @@
               standalonePackagesAttrs."walrus-sites-${latest}"
             else
               throw "No mainnet walrus-sites release found";
+
+          seal =
+            let
+              latest = getLatestSeal;
+            in
+            if latest != null then
+              sealSourcePackagesAttrs."seal-cli-source-${latest}"
+            else
+              throw "No seal release found";
+
+          seal-server =
+            let
+              latest = getLatestSeal;
+            in
+            if latest != null then
+              sealSourcePackagesAttrs."key-server-source-${latest}"
+            else
+              throw "No seal release found";
+
+          # Move framework aliases (latest mainnet sui release) for use as Move.lock pins.
+          move-stdlib =
+            let
+              latest = getLatestSourceMainnet;
+            in
+            if latest != null then
+              moveFrameworkPackagesAttrs."move-stdlib-${latest}"
+            else
+              throw "No mainnet source-built sui release found";
+
+          sui-framework =
+            let
+              latest = getLatestSourceMainnet;
+            in
+            if latest != null then
+              moveFrameworkPackagesAttrs."sui-framework-${latest}"
+            else
+              throw "No mainnet source-built sui release found";
+
+          sui-system =
+            let
+              latest = getLatestSourceMainnet;
+            in
+            if latest != null then
+              moveFrameworkPackagesAttrs."sui-system-${latest}"
+            else
+              throw "No mainnet source-built sui release found";
+
+          deepbook =
+            let
+              latest = getLatestSourceMainnet;
+            in
+            if latest != null then
+              moveFrameworkPackagesAttrs."deepbook-${latest}"
+            else
+              throw "No mainnet source-built sui release found";
+
+          bridge =
+            let
+              latest = getLatestSourceMainnet;
+            in
+            if latest != null then
+              moveFrameworkPackagesAttrs."bridge-${latest}"
+            else
+              throw "No mainnet source-built sui release found";
+
+          sui-indexer-alt =
+            let
+              latest = getLatestSourceMainnet;
+            in
+            if latest != null then
+              sourcePackagesAttrs."sui-indexer-alt-source-${latest}"
+            else
+              throw "No mainnet source-built sui release found";
+
+          sui-indexer-alt-jsonrpc =
+            let
+              latest = getLatestSourceMainnet;
+            in
+            if latest != null then
+              sourcePackagesAttrs."sui-indexer-alt-jsonrpc-source-${latest}"
+            else
+              throw "No mainnet source-built sui release found";
         }
         // standalonePackagesAttrs
-        // sourcePackagesAttrs;
+        // sourcePackagesAttrs
+        // walrusSourcePackagesAttrs
+        // sealSourcePackagesAttrs
+        // moveFrameworkPackagesAttrs;
 
         devShells.default = pkgs.mkShell {
           inherit buildInputs;
@@ -548,10 +1010,34 @@
           '';
         };
 
+        # NixOS modules are exposed at the top level (see outputs below).
+
         apps = {
           default = {
             type = "app";
             program = "${self.packages.${system}.default}/bin/suiup";
+          };
+
+          test-env = {
+            type = "app";
+            # Boots a private postgres + `sui start --with-faucet --with-indexer
+            # --with-graphql` in a state dir. Endpoints printed at startup;
+            # consumer test suites read SUI_RPC_URL / SUI_FAUCET_URL / DATABASE_URL.
+            program = toString (
+              pkgs.writeShellScript "suiup-test-env" ''
+                set -euo pipefail
+                export PATH="${
+                  pkgs.lib.makeBinPath [
+                    self.packages.${system}.sui
+                    pkgs.postgresql_17
+                    pkgs.coreutils
+                    pkgs.gnused
+                    pkgs.findutils
+                  ]
+                }:$PATH"
+                exec ${pkgs.bash}/bin/bash ${./nix/test-env.sh} "$@"
+              ''
+            );
           };
 
           update-releases = {
@@ -586,5 +1072,36 @@
           };
         };
       }
-    );
+    )
+    // {
+      # System-agnostic outputs.
+      nixosModules = rec {
+        postgresql-sui = ./nix/modules/postgresql-sui.nix;
+        sui-fullnode = ./nix/modules/sui-fullnode.nix;
+        sui-indexer-alt = ./nix/modules/sui-indexer-alt.nix;
+        sui-indexer-alt-jsonrpc = ./nix/modules/sui-indexer-alt-jsonrpc.nix;
+        walrus-aggregator = ./nix/modules/walrus-aggregator.nix;
+        walrus-publisher = ./nix/modules/walrus-publisher.nix;
+        seal-key-server = ./nix/modules/seal-key-server.nix;
+        sui-stack = ./nix/modules/sui-stack.nix;
+
+        # Importing nixosModules.default pulls in every per-service module
+        # plus the meta wrap, and auto-injects `suiupPackages` from this flake.
+        default =
+          { pkgs, ... }:
+          {
+            imports = [
+              postgresql-sui
+              sui-fullnode
+              sui-indexer-alt
+              sui-indexer-alt-jsonrpc
+              walrus-aggregator
+              walrus-publisher
+              seal-key-server
+              sui-stack
+            ];
+            _module.args.suiupPackages = self.packages.${pkgs.system};
+          };
+      };
+    };
 }
