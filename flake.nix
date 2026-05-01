@@ -8,10 +8,6 @@
       url = "github:cachix/git-hooks.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
   outputs =
@@ -20,26 +16,43 @@
       nixpkgs,
       flake-utils,
       pre-commit-hooks,
-      rust-overlay,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
       let
-        overlays = [ (import rust-overlay) ];
-        pkgs = import nixpkgs {
-          inherit system overlays;
-        };
+        pkgs = import nixpkgs { inherit system; };
 
         # Standalone releases: version -> hash mapping
         # These are pre-built binaries that will be patched with Nix dependencies
         # Update with: nix run .#update-releases
         standaloneReleases = builtins.fromJSON (builtins.readFile ./nix/releases.json);
 
-        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          extensions = [
-            "rust-src"
-            "rustfmt"
-          ];
+        sourceReleaseDir = ./nix/source-releases;
+        sourceReleaseFileNames = builtins.attrNames (builtins.readDir sourceReleaseDir);
+        sourceReleaseNixFiles = builtins.sort (a: b: a < b) (
+          builtins.filter (name: pkgs.lib.hasSuffix ".nix" name) sourceReleaseFileNames
+        );
+        sourceReleases = builtins.listToAttrs (
+          map (
+            file:
+            let
+              release = import (sourceReleaseDir + "/${file}");
+            in
+            pkgs.lib.nameValuePair release.tag release
+          ) sourceReleaseNixFiles
+        );
+
+        rustToolchain = {
+          cargo = pkgs.cargo;
+          rustc = pkgs.rustc;
+          rustfmt = pkgs.rustfmt;
+          rustLibSrc = pkgs.rustPlatform.rustLibSrc;
+        };
+
+        rustToolchainSui = rustToolchain;
+        rustPlatformSui = pkgs.makeRustPlatform {
+          cargo = rustToolchainSui.cargo;
+          rustc = rustToolchainSui.rustc;
         };
 
         buildInputs =
@@ -54,7 +67,8 @@
           ];
 
         nativeBuildInputs = with pkgs; [
-          rustToolchain
+          rustToolchain.cargo
+          rustToolchain.rustc
           pkg-config
         ];
 
@@ -230,6 +244,58 @@
             };
           };
 
+        mkSuiSourceBinary =
+          {
+            binaryName,
+            release,
+          }:
+          let
+            fetchedSrc = pkgs.fetchFromGitHub {
+              owner = "MystenLabs";
+              repo = "sui";
+              rev = release.rev;
+              hash = release.srcHash;
+            };
+          in
+          rustPlatformSui.buildRustPackage {
+            pname = "${binaryName}-source";
+            version = release.tag;
+
+            src = fetchedSrc;
+
+            cargoHash = release.cargoHash;
+            cargoBuildFlags = [ "--bin=${binaryName}" ];
+
+            nativeBuildInputs = [
+              pkgs.cmake
+              pkgs.clang
+              pkgs.pkg-config
+              pkgs.protobuf
+            ];
+
+            buildInputs = [
+              pkgs.openssl
+              pkgs.zlib
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+              pkgs.darwin.apple_sdk.frameworks.Security
+              pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
+            ];
+
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            PROTOC = "${pkgs.protobuf}/bin/protoc";
+
+            doCheck = false;
+
+            meta = with pkgs.lib; {
+              description = "${binaryName} built from MystenLabs/sui source (${release.tag})";
+              homepage = "https://github.com/MystenLabs/sui";
+              license = licenses.asl20;
+              maintainers = [ ];
+              mainProgram = binaryName;
+            };
+          };
+
         # Generate all standalone binary packages
         standalonePackages = pkgs.lib.flatten (
           pkgs.lib.mapAttrsToList (
@@ -275,6 +341,34 @@
         # Create standalone packages as an attrset first
         standalonePackagesAttrs = builtins.listToAttrs standalonePackages;
 
+        sourceBinaryNames = [
+          "sui"
+          "sui-node"
+          "move-analyzer"
+        ];
+
+        sourcePackages = pkgs.lib.flatten (
+          map (
+            binaryName:
+            map (
+              tag:
+              pkgs.lib.nameValuePair "${binaryName}-source-${tag}" (mkSuiSourceBinary {
+                inherit binaryName;
+                release = sourceReleases.${tag};
+              })
+            ) (builtins.attrNames sourceReleases)
+          ) sourceBinaryNames
+        );
+
+        sourcePackagesAttrs = builtins.listToAttrs sourcePackages;
+
+        getLatestSourceMainnet =
+          let
+            mainnetReleases = pkgs.lib.filterAttrs (tag: _: pkgs.lib.hasPrefix "mainnet-" tag) sourceReleases;
+            sortedTags = builtins.sort (a: b: a > b) (builtins.attrNames mainnetReleases);
+          in
+          if sortedTags == [ ] then null else builtins.head sortedTags;
+
         preCommitCheck = pre-commit-hooks.lib.${system}.run {
           src = ./.;
           hooks = {
@@ -284,7 +378,7 @@
             rustfmt-local = {
               enable = true;
               name = "rustfmt";
-              entry = "${rustToolchain}/bin/rustfmt --edition 2024 --check";
+              entry = "${rustToolchain.rustfmt}/bin/rustfmt --edition 2024 --check";
               language = "system";
               files = "\\.rs$";
             };
@@ -313,7 +407,16 @@
       {
         checks = {
           pre-commit = preCommitCheck;
-          latest-sui = mkLatestAliasCheck "sui" standalonePackagesAttrs."sui-${getLatestMainnet "sui"}";
+          latest-sui = mkLatestAliasCheck "sui" sourcePackagesAttrs."sui-source-${getLatestSourceMainnet}";
+          latest-sui-binary =
+            mkLatestAliasCheck "sui-binary"
+              standalonePackagesAttrs."sui-${getLatestMainnet "sui"}";
+          latest-sui-node =
+            mkLatestAliasCheck "sui-node"
+              sourcePackagesAttrs."sui-node-source-${getLatestSourceMainnet}";
+          latest-move-analyzer =
+            mkLatestAliasCheck "move-analyzer"
+              sourcePackagesAttrs."move-analyzer-source-${getLatestSourceMainnet}";
           latest-mvr = mkLatestAliasCheck "mvr" standalonePackagesAttrs."mvr-${getLatestMainnet "mvr"}";
           latest-walrus =
             mkLatestAliasCheck "walrus"
@@ -330,12 +433,39 @@
           # Aliases to latest mainnet releases
           sui =
             let
+              latest = getLatestSourceMainnet;
+            in
+            if latest != null then
+              sourcePackagesAttrs."sui-source-${latest}"
+            else
+              throw "No mainnet source-built sui release found";
+
+          sui-binary =
+            let
               latest = getLatestMainnet "sui";
             in
             if latest != null then
               standalonePackagesAttrs."sui-${latest}"
             else
-              throw "No mainnet sui release found";
+              throw "No mainnet sui binary release found";
+
+          sui-node =
+            let
+              latest = getLatestSourceMainnet;
+            in
+            if latest != null then
+              sourcePackagesAttrs."sui-node-source-${latest}"
+            else
+              throw "No mainnet source-built sui-node release found";
+
+          move-analyzer =
+            let
+              latest = getLatestSourceMainnet;
+            in
+            if latest != null then
+              sourcePackagesAttrs."move-analyzer-source-${latest}"
+            else
+              throw "No mainnet source-built move-analyzer release found";
 
           mvr =
             let
@@ -361,7 +491,8 @@
             else
               throw "No mainnet walrus-sites release found";
         }
-        // standalonePackagesAttrs;
+        // standalonePackagesAttrs
+        // sourcePackagesAttrs;
 
         devShells.default = pkgs.mkShell {
           inherit buildInputs;
@@ -375,7 +506,7 @@
             ])
             ++ preCommitCheck.enabledPackages;
 
-          RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
+          RUST_SRC_PATH = "${rustToolchain.rustLibSrc}/library";
 
           # Set up XDG_DATA_HOME to point to a local directory for development
           shellHook = ''
