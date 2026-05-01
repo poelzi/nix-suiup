@@ -438,9 +438,28 @@
               standalonePackagesAttrs."walrus-sites-${getLatestMainnet "walrus-sites"}";
         };
 
-        packages = {
-          # Default build without patchelf
-          default = mkSuiup { enablePatchelf = true; };
+        packages = rec {
+          # The suiup CLI itself.
+          suiup = mkSuiup { enablePatchelf = true; };
+
+          # Default link-farm: every Sui-ecosystem tool we ship plus suiup.
+          # `nix run` resolves to suiup via mainProgram.
+          default = pkgs.symlinkJoin {
+            name = "suiup-toolkit";
+            paths = [
+              suiup
+              sui
+              sui-node
+              move-analyzer
+              walrus
+              walrus-sites
+              mvr
+            ];
+            meta = {
+              description = "Sui toolkit: suiup + sui, sui-node, move-analyzer (source) + walrus, site-builder, mvr (binary)";
+              mainProgram = "suiup";
+            };
+          };
 
           # Aliases to latest mainnet releases
           sui =
