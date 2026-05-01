@@ -285,6 +285,18 @@
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             PROTOC = "${pkgs.protobuf}/bin/protoc";
 
+            # The bin_version macro reads these at compile time; without them
+            # it panics ("unable to query git revision") because fetchFromGitHub
+            # strips the .git directory.
+            GIT_REVISION = release.rev;
+            VERGEN_GIT_SHA = release.rev;
+
+            # gcc >= 13 no longer transitively includes <cstdint>; the vendored
+            # rocksdb headers in librocksdb-sys reference uint64_t etc. without
+            # it. Scope the force-include to C++ via CXXFLAGS (cc-rs honors
+            # this only for C++ compilation, leaving C and .S builds alone).
+            env.CXXFLAGS = "-include cstdint";
+
             doCheck = false;
 
             meta = with pkgs.lib; {
