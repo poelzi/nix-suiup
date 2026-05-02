@@ -536,6 +536,7 @@
 
         walrusSourceBinaryNames = [
           "walrus"
+          "walrus-deploy"
           "walrus-node"
           "walrus-upload-relay"
         ];
@@ -556,6 +557,43 @@
         walrusSourcePackagesAttrs = builtins.listToAttrs walrusSourcePackages;
 
         getLatestWalrusSourceMainnet = latestMainnetTag walrusSourceReleases;
+
+        walrusContracts =
+          let
+            release = walrusSourceReleases.${getLatestWalrusSourceMainnet};
+            src = pkgs.fetchFromGitHub {
+              owner = "MystenLabs";
+              repo = "walrus";
+              rev = release.rev;
+              hash = release.srcHash;
+            };
+          in
+          pkgs.runCommand "walrus-contracts-${release.tag}" { } ''
+            mkdir -p "$out"
+            cp -R ${src}/contracts "$out/contracts"
+          '';
+
+        localWalrusEnv = pkgs.writeShellApplication {
+          name = "suiup-local-walrus-env";
+          runtimeInputs = [
+            standalonePackagesAttrs."sui-${getLatestMainnet "sui"}"
+            walrusSourcePackagesAttrs."walrus-source-${getLatestWalrusSourceMainnet}"
+            walrusSourcePackagesAttrs."walrus-deploy-source-${getLatestWalrusSourceMainnet}"
+            walrusSourcePackagesAttrs."walrus-node-source-${getLatestWalrusSourceMainnet}"
+            pkgs.bash
+            pkgs.coreutils
+            pkgs.curl
+            pkgs.findutils
+            pkgs.gawk
+            pkgs.gnugrep
+            pkgs.gnused
+            pkgs.jq
+          ];
+          text = ''
+            export SUIUP_WALRUS_CONTRACTS="''${SUIUP_WALRUS_CONTRACTS:-${walrusContracts}/contracts}"
+            exec ${pkgs.bash}/bin/bash ${./nix/local-walrus-env.sh} "$@"
+          '';
+        };
 
         sealSourceBinaryNames = [
           "seal-cli"
@@ -696,14 +734,16 @@
           latest-walrus-node =
             mkLatestAliasCheck "walrus-node"
               walrusSourcePackagesAttrs."walrus-node-source-${getLatestWalrusSourceMainnet}";
+          latest-walrus-deploy =
+            mkLatestAliasCheck "walrus-deploy"
+              walrusSourcePackagesAttrs."walrus-deploy-source-${getLatestWalrusSourceMainnet}";
           latest-walrus-upload-relay =
             mkLatestAliasCheck "walrus-upload-relay"
               walrusSourcePackagesAttrs."walrus-upload-relay-source-${getLatestWalrusSourceMainnet}";
           latest-walrus-sites =
             mkLatestAliasCheck "walrus-sites"
               standalonePackagesAttrs."walrus-sites-${getLatestMainnet "walrus-sites"}";
-          latest-seal =
-            mkLatestAliasCheck "seal" sealSourcePackagesAttrs."seal-cli-source-${getLatestSeal}";
+          latest-seal = mkLatestAliasCheck "seal" sealSourcePackagesAttrs."seal-cli-source-${getLatestSeal}";
           latest-seal-server =
             mkLatestAliasCheck "seal-server"
               sealSourcePackagesAttrs."key-server-source-${getLatestSeal}";
@@ -713,6 +753,11 @@
           latest-sui-indexer-alt-jsonrpc =
             mkLatestAliasCheck "sui-indexer-alt-jsonrpc"
               sourcePackagesAttrs."sui-indexer-alt-jsonrpc-source-${getLatestSourceMainnet}";
+
+          local-walrus-env-syntax = pkgs.runCommand "local-walrus-env-syntax" { } ''
+            ${pkgs.bash}/bin/bash -n ${./nix/local-walrus-env.sh}
+            touch "$out"
+          '';
 
           # NixOS VM smoke test: boots `postgres + sui start` in a VM and
           # verifies the JSON-RPC answers. Uses the standalone (.#sui-binary)
@@ -734,8 +779,14 @@
                 systemd.services.sui-local-net = {
                   description = "sui start --force-regenesis (test harness)";
                   wantedBy = [ "multi-user.target" ];
-                  after = [ "network-online.target" "postgresql.service" ];
-                  wants = [ "network-online.target" "postgresql.service" ];
+                  after = [
+                    "network-online.target"
+                    "postgresql.service"
+                  ];
+                  wants = [
+                    "network-online.target"
+                    "postgresql.service"
+                  ];
                   serviceConfig = {
                     Type = "exec";
                     Restart = "on-failure";
@@ -798,15 +849,17 @@
               sui-indexer-alt
               sui-indexer-alt-jsonrpc
               walrus
+              walrus-deploy
               walrus-node
               walrus-upload-relay
               walrus-sites
               seal
               seal-server
               mvr
+              local-walrus-env
             ];
             meta = {
-              description = "Sui toolkit: suiup + sui/sui-node/move-analyzer/sui-indexer-alt(+jsonrpc) (source) + walrus/walrus-node/walrus-upload-relay/seal-cli/key-server (source) + site-builder/mvr (binary)";
+              description = "Sui toolkit: suiup + Sui/Walrus/Seal source tools, site-builder/mvr binaries, and local Sui/Walrus test harness";
               mainProgram = "suiup";
             };
           };
@@ -880,6 +933,15 @@
               walrusSourcePackagesAttrs."walrus-node-source-${latest}"
             else
               throw "No mainnet source-built walrus-node release found";
+
+          walrus-deploy =
+            let
+              latest = getLatestWalrusSourceMainnet;
+            in
+            if latest != null then
+              walrusSourcePackagesAttrs."walrus-deploy-source-${latest}"
+            else
+              throw "No mainnet source-built walrus-deploy release found";
 
           walrus-upload-relay =
             let
@@ -980,6 +1042,8 @@
               sourcePackagesAttrs."sui-indexer-alt-jsonrpc-source-${latest}"
             else
               throw "No mainnet source-built sui release found";
+
+          local-walrus-env = localWalrusEnv;
         }
         // standalonePackagesAttrs
         // sourcePackagesAttrs
@@ -1038,6 +1102,11 @@
                 exec ${pkgs.bash}/bin/bash ${./nix/test-env.sh} "$@"
               ''
             );
+          };
+
+          local-walrus-env = {
+            type = "app";
+            program = "${self.packages.${system}.local-walrus-env}/bin/suiup-local-walrus-env";
           };
 
           update-releases = {
