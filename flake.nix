@@ -2,7 +2,7 @@
   description = "Sui Tooling Version Manager";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-utils.url = "github:numtide/flake-utils";
     pre-commit-hooks = {
       url = "github:cachix/git-hooks.nix";
@@ -261,6 +261,14 @@
             };
           };
 
+        # KNOWN ISSUE (nixpkgs 26.05): the Sui workspace vendors
+        # non-deterministically under 26.05's fetch-cargo-vendor-util-v2 (the
+        # ~12 git dependencies fetch with a varying NAR hash), so a single
+        # static cargoHash per release is not reliably reproducible across the
+        # different --bin targets. `sui` itself builds; sui-node/move-analyzer/
+        # sui-indexer-alt*/ are flaky. Walrus/Seal are unaffected (few/no git
+        # deps). Proper fix: switch to cargoLock.outputHashes pinning each git
+        # dep. Tracked as a 26.05 follow-up.
         mkSuiSourceBinary =
           {
             binaryName,
@@ -761,9 +769,13 @@
 
           # NixOS VM smoke test: boots `postgres + sui start` in a VM and
           # verifies the JSON-RPC answers. Uses the standalone (.#sui-binary)
-          # to avoid forcing a full source build — for source-build coverage
+          # to avoid forcing a full source build -- for source-build coverage
           # use `nix build .#sui` directly.
-          testHarnessSmoke = pkgs.nixosTest {
+          # KNOWN ISSUE (nixpkgs 26.05): the VM boots, but postgresql.service
+          # fails to start (start-limit-hit) under 26.05; the JSON-RPC probe is
+          # therefore never reached. Needs the postgresql-sui module revisited
+          # for 26.05. Tracked as a 26.05 follow-up.
+          testHarnessSmoke = pkgs.testers.nixosTest {
             name = "suiup-test-harness-smoke";
             nodes.machine =
               { ... }:
@@ -810,9 +822,7 @@
                 };
 
                 # The local network needs ample fds.
-                systemd.extraConfig = ''
-                  DefaultLimitNOFILE=65536
-                '';
+                systemd.settings.Manager.DefaultLimitNOFILE = 65536;
               };
 
             testScript = ''
