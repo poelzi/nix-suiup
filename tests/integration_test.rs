@@ -5,7 +5,7 @@ mod test_utils;
 
 #[cfg(test)]
 mod tests {
-    use crate::test_utils::TestEnv;
+    use crate::test_utils::{TestEnv, detect_os_arch_for_tests};
     use anyhow::Result;
     use assert_cmd::Command;
     use assert_cmd::cargo::cargo_bin_cmd;
@@ -287,6 +287,44 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_complete_update_command_replaces_executable() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let test_env = TestEnv::new()?;
+        test_env.initialize_paths()?;
+
+        let target = test_env.temp_dir.path().join("suiup-target");
+        let source = test_env.temp_dir.path().join("suiup-source");
+
+        fs::write(&target, "#!/bin/sh\necho old\n")?;
+        fs::write(&source, "#!/bin/sh\necho new\n")?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755))?;
+
+        let mut cmd = suiup_command(
+            vec![
+                "self",
+                "complete-update",
+                "--target",
+                target.to_str().unwrap(),
+                "--source",
+                source.to_str().unwrap(),
+            ],
+            &test_env,
+        );
+        cmd.assert().success();
+
+        let mut replaced = Command::new(&target);
+        replaced
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("new"));
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_default_workflow() -> Result<(), anyhow::Error> {
         let test_env = TestEnv::new()?;
@@ -429,6 +467,41 @@ mod tests {
         cmd.assert()
             .success()
             .stdout(predicate::str::contains("1.18.2"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_walrus_install_prefers_matching_cached_archive() -> Result<()> {
+        let test_env = TestEnv::new()?;
+        test_env.initialize_paths()?;
+
+        let (os, arch) = detect_os_arch_for_tests();
+        let version = "v1.48.1";
+        let sui_archive = format!("sui-testnet-{version}-{os}-{arch}.tgz");
+        let walrus_archive = format!("walrus-testnet-{version}-{os}-{arch}.tgz");
+
+        test_env.create_cached_archive(&sui_archive, "sui", b"sui payload")?;
+        test_env.create_cached_archive(&walrus_archive, "walrus", b"walrus payload")?;
+
+        let mut cmd = suiup_command(vec!["install", "walrus@testnet-v1.48.1", "-y"], &test_env);
+
+        #[cfg(windows)]
+        let extracted_binary = test_env
+            .data_dir
+            .join("suiup/binaries/testnet/walrus-v1.48.1.exe");
+        #[cfg(not(windows))]
+        let extracted_binary = test_env
+            .data_dir
+            .join("suiup/binaries/testnet/walrus-v1.48.1");
+
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains(format!(
+                "Found {walrus_archive} in cache"
+            )));
+
+        assert_eq!(fs::read(extracted_binary)?, b"walrus payload");
 
         Ok(())
     }
@@ -713,6 +786,58 @@ mod tests {
 
         // But directory should still exist
         assert!(cache_dir.exists());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_status_no_binaries_installed() -> Result<()> {
+        let test_env = TestEnv::new()?;
+        test_env.initialize_paths()?;
+
+        let mut cmd = suiup_command(vec!["status"], &test_env);
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains("No binaries installed"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_status_with_installed_binary() -> Result<()> {
+        if !github_is_reachable() {
+            return Ok(());
+        }
+
+        let test_env = TestEnv::new()?;
+        test_env.initialize_paths()?;
+        test_env.copy_testnet_releases_to_cache()?;
+
+        // Install sui from cached archive
+        let mut cmd = suiup_command(vec!["install", "sui@testnet-1.39.3", "-y"], &test_env);
+        cmd.assert().success();
+
+        // Run status
+        let mut cmd = suiup_command(vec!["status"], &test_env);
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains("Checking for updates"))
+            .stdout(predicate::str::contains("sui"))
+            .stdout(predicate::str::contains("MystenLabs/sui"))
+            .stdout(predicate::str::contains("testnet"))
+            .stdout(predicate::str::contains("v1.39.3"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_status_help_mentions_list() -> Result<()> {
+        let test_env = TestEnv::new()?;
+
+        let mut cmd = suiup_command(vec!["status", "--help"], &test_env);
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains("suiup list"));
 
         Ok(())
     }

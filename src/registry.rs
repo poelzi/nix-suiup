@@ -34,6 +34,8 @@ pub struct BinaryConfig {
     pub nightly_toolchain: Option<String>,
     #[serde(default)]
     pub shared_repo_binary: bool,
+    #[serde(default)]
+    pub experimental: bool,
 }
 
 fn default_main_branch() -> String {
@@ -182,7 +184,9 @@ mod tests {
         for name in &[
             "sui",
             "sui-node",
+            "sui-fork",
             "mvr",
+            "seal",
             "walrus",
             "site-builder",
             "move-analyzer",
@@ -211,11 +215,31 @@ mod tests {
     }
 
     #[test]
+    fn sui_fork_config_values() {
+        let config = BinaryRegistry::global().get("sui-fork").unwrap();
+        assert_eq!(config.repository, "MystenLabs/sui");
+        assert_eq!(config.installation_type, InstallationType::Archive);
+        assert!(config.network_based);
+        assert!(!config.supports_debug);
+        assert!(config.shared_repo_binary);
+        assert!(config.experimental);
+    }
+
+    #[test]
     fn mvr_config_values() {
         let config = BinaryRegistry::global().get("mvr").unwrap();
         assert_eq!(config.repository, "MystenLabs/mvr");
         assert_eq!(config.installation_type, InstallationType::Standalone);
         assert!(!config.network_based);
+    }
+
+    #[test]
+    fn seal_config_values() {
+        let config = BinaryRegistry::global().get("seal").unwrap();
+        assert_eq!(config.repository, "MystenLabs/seal");
+        assert_eq!(config.installation_type, InstallationType::Standalone);
+        assert!(!config.network_based);
+        assert_eq!(config.cargo_package.as_deref(), Some("seal-cli"));
     }
 
     #[test]

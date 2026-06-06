@@ -11,6 +11,7 @@ mod patch;
 mod remove;
 mod self_;
 mod show;
+mod status;
 mod switch;
 mod update;
 mod which;
@@ -50,6 +51,7 @@ pub enum Commands {
     Self_(self_::Command),
 
     Show(show::Command),
+    Status(status::Command),
     Switch(switch::Command),
     Update(update::Command),
     Which(which::Command),
@@ -84,6 +86,7 @@ impl Command {
             Commands::List(cmd) => cmd.exec(github_token_ref).await,
             Commands::Self_(cmd) => cmd.exec().await,
             Commands::Show(cmd) => cmd.exec(),
+            Commands::Status(cmd) => cmd.exec(github_token_ref).await,
             Commands::Switch(cmd) => cmd.exec(),
             Commands::Update(cmd) => cmd.exec(github_token_ref).await,
             Commands::Which(cmd) => cmd.exec(),

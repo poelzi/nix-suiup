@@ -1,3 +1,21 @@
+## 0.0.13 - 2026-04-07
+
+- Added support for installing the experimental `sui-fork` binary (without debug builds).
+- Fixed status command version comparison by using proper semver parsing.
+
+## 0.0.12 - 2026-04-06
+
+- Added `suiup status` command to check for available updates across all installed binaries.
+- Fixed self-update on Linux when the OS throws an error due to in-place file copying.
+
+## 0.0.11 - 2026-04-02
+
+- Added support for installing the `seal` binary.
+- Improved standalone release matching for `linux`/`ubuntu`, `arm64`/`aarch64`, and tags like `seal-v0.6.4`.
+- Stabilized environment-dependent doctor tests when running in parallel.
+- Fixed dependency security advisories and CVEs.
+- Fixed Windows installation documentation.
+
 ## 0.0.10 - 2026-02-26
 
 - Added support for installing `sui-node` binary.
