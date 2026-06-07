@@ -46,6 +46,17 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # nixpkgs only auto-creates the cluster directory (via systemd
+    # StateDirectory) when dataDir is the package default. With this custom
+    # dataDir, 26.05's hardened postgresql.service fails at the NAMESPACE step
+    # ("Failed to set up mount namespacing: ... No such file or directory")
+    # because it bind-mounts dataDir before the pre-start script can mkdir it.
+    # Create it (and its parent) up front so the service can start.
+    systemd.tmpfiles.rules = [
+      "d ${builtins.dirOf cfg.dataDir} 0755 postgres postgres - -"
+      "d ${cfg.dataDir} 0700 postgres postgres - -"
+    ];
+
     services.postgresql = {
       enable = true;
       package = cfg.package;

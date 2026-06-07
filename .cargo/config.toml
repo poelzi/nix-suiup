@@ -1,0 +1,13 @@
+# Convenience alias for running the suite on NixOS.
+#
+# The integration tests download prebuilt, generic-linux binaries (sui/walrus/
+# mvr) and execute them. NixOS can't run those directly, so build suiup with the
+# `nix-patchelf` feature (it rewrites each installed binary's interpreter/rpath).
+# The feature reads SUIUP_PATCHELF_CONFIG, which the flake devShell exports, so
+# run this from inside `nix develop`:
+#
+#     nix develop -c cargo test-nixos
+#
+# On generic Linux (e.g. CI), plain `cargo test` works as-is.
+[alias]
+test-nixos = "test --features nix-patchelf"

@@ -29,7 +29,13 @@ static ZIP_FILES_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 impl TestEnv {
     pub fn new() -> Result<Self> {
-        let env_guard = ENV_VARS_MUTEX.lock().expect("failed to lock env mutex");
+        // Recover from a poisoned mutex: if a previous test panicked while
+        // holding this guard, later tests should still run and report their own
+        // result instead of cascading into misleading PoisonError panics that
+        // hide the real failure.
+        let env_guard = ENV_VARS_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp_dir = TempDir::new()?;
         let base = temp_dir.path();
 
@@ -127,7 +133,7 @@ impl TestEnv {
     pub fn copy_testnet_releases_to_cache(&self) -> Result<()> {
         let _guard = ZIP_FILES_MUTEX
             .lock()
-            .expect("failed to lock zip-files mutex");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Create cache directory if it doesn't exist
         std::fs::create_dir_all(&self.cache_dir)?;
 
@@ -160,7 +166,7 @@ impl TestEnv {
     ) -> Result<PathBuf> {
         let _guard = ZIP_FILES_MUTEX
             .lock()
-            .expect("failed to lock zip-files mutex");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let releases_dir = self.cache_dir.join("suiup").join("releases");
         std::fs::create_dir_all(&releases_dir)?;
 

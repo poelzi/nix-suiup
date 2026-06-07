@@ -771,10 +771,6 @@
           # verifies the JSON-RPC answers. Uses the standalone (.#sui-binary)
           # to avoid forcing a full source build -- for source-build coverage
           # use `nix build .#sui` directly.
-          # KNOWN ISSUE (nixpkgs 26.05): the VM boots, but postgresql.service
-          # fails to start (start-limit-hit) under 26.05; the JSON-RPC probe is
-          # therefore never reached. Needs the postgresql-sui module revisited
-          # for 26.05. Tracked as a 26.05 follow-up.
           testHarnessSmoke = pkgs.testers.nixosTest {
             name = "suiup-test-harness-smoke";
             nodes.machine =
@@ -783,6 +779,14 @@
                 imports = [
                   self.nixosModules.postgresql-sui
                 ];
+
+                # sui-indexer-alt sizes its pipeline mpsc channels as
+                # `num_cpus::get() / 2`, which is 0 on a single-vCPU VM and
+                # panics ("mpsc bounded channel requires buffer > 0"), taking
+                # down `sui start`. Give it >=2 cores, and enough RAM that
+                # sui + postgres + indexer don't OOM.
+                virtualisation.cores = 4;
+                virtualisation.memorySize = 4096;
 
                 services.postgresql-sui.enable = true;
 
@@ -805,6 +809,14 @@
                     RestartSec = "5s";
                     StateDirectory = "sui-local-net";
                     WorkingDirectory = "/var/lib/sui-local-net";
+                    # `sui start` writes its ephemeral config under $HOME; point
+                    # it at the writable state dir.
+                    Environment = "HOME=/var/lib/sui-local-net";
+                    # NOTE: --force-regenesis (ephemeral, fresh genesis each
+                    # boot) and --network.config (persisted state) are mutually
+                    # exclusive in current sui; passing both makes `sui start`
+                    # exit immediately. The smoke test wants an ephemeral net,
+                    # so we keep --force-regenesis and omit --network.config.
                     ExecStart = pkgs.lib.escapeShellArgs [
                       "${self.packages.${system}.sui-binary}/bin/sui"
                       "start"
@@ -815,8 +827,6 @@
                       "9000"
                       "--epoch-duration-ms"
                       "60000"
-                      "--network.config"
-                      "/var/lib/sui-local-net/sui-config"
                     ];
                   };
                 };
@@ -1075,12 +1085,22 @@
 
           RUST_SRC_PATH = "${rustToolchain.rustLibSrc}/library";
 
+          # The integration tests download prebuilt, generic-linux binaries
+          # (sui/walrus/mvr) and execute them (`<bin> --version`). NixOS can't
+          # run those directly -- the /lib64 nix-ld here is just the inert stub
+          # -- so we use suiup's own nix-patchelf feature: built with that
+          # feature and pointed at this runtime-deps config, suiup patchelfs
+          # each installed binary's interpreter/rpath so it runs. Run with:
+          #   nix develop -c cargo test --features nix-patchelf
+          SUIUP_PATCHELF_CONFIG = pkgs.writeText "nix-runtime-deps.json" patchData;
+
           # Set up XDG_DATA_HOME to point to a local directory for development
           shellHook = ''
             export XDG_DATA_HOME="''${XDG_DATA_HOME:-$HOME/.local/share}"
             ${preCommitCheck.shellHook}
             echo "Nix development shell for suiup"
             echo "XDG_DATA_HOME: $XDG_DATA_HOME"
+            echo "Run the test suite with: cargo test-nixos  (= cargo test --features nix-patchelf)"
           '';
         };
 
